@@ -6,8 +6,18 @@ services:
     container_name: qq-farm-bot-ui
     restart: unless-stopped
     environment:
-      ADMIN_PASSWORD: admin
-      TZ: Asia/Shanghai
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD:-admin}
+      TZ: ${TZ:-Asia/Shanghai}
+      FARM_SERVER_URL: ${FARM_SERVER_URL:-wss://gate-obt.nqf.qq.com/prod/ws}
+      FARM_CLIENT_VERSION: ${FARM_CLIENT_VERSION:-1.7.0.9_20260313}
+      FARM_PLATFORM: ${FARM_PLATFORM:-qq}
+      FARM_OS: ${FARM_OS:-iOS}
+      FARM_DEVICE_SYS_SOFTWARE: ${FARM_DEVICE_SYS_SOFTWARE:-iOS 18.7}
+      FARM_DEVICE_NETWORK: ${FARM_DEVICE_NETWORK:-wifi}
+      FARM_DEVICE_MEMORY: ${FARM_DEVICE_MEMORY:-7672}
+      FARM_DEVICE_ID: ${FARM_DEVICE_ID:-iPhone X<iPhone18,3>}
+      FARM_RECONNECT_MIN_MS: ${FARM_RECONNECT_MIN_MS:-3000}
+      FARM_RECONNECT_MAX_MS: ${FARM_RECONNECT_MAX_MS:-60000}
     ports:
       - "3000:3000"
     volumes:
