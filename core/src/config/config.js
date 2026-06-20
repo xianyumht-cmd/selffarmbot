@@ -2,13 +2,17 @@ const process = require('node:process');
 /**
  * 配置常量与枚举定义
  */
+const { getProtocolProfileFromEnv } = require('./protocol');
+
+const protocolProfile = getProtocolProfileFromEnv();
 
 const CONFIG = {
-    serverUrl: 'wss://gate-obt.nqf.qq.com/prod/ws',
-    clientVersion: '1.7.0.9_20260313',
-    platform: 'qq',              // 平台: qq 或 wx (可通过 --wx 切换为微信)
-    os: 'iOS',
-    heartbeatInterval: 25000,    // 心跳间隔 25秒
+    protocol: protocolProfile,
+    serverUrl: protocolProfile.serverUrl,
+    clientVersion: protocolProfile.clientVersion,
+    platform: protocolProfile.platform, // 平台: qq 或 wx
+    os: protocolProfile.os,
+    heartbeatInterval: Number(process.env.FARM_HEARTBEAT_INTERVAL_MS || 25000), // 心跳间隔 25秒
     farmCheckInterval: 2000,      // 兼容旧逻辑：自己农场固定巡查间隔(ms)
     friendCheckInterval: 10000,   // 兼容旧逻辑：好友固定巡查间隔(ms)
     farmCheckIntervalMin: 2000,   // 新逻辑：农场巡查间隔最小值(ms)
@@ -19,12 +23,9 @@ const CONFIG = {
     adminPassword: process.env.ADMIN_PASSWORD || 'admin',
     tokenExpirationHours: 0.5,    // Token 过期时间（小时）
     device_info: {
-        client_version: "1.7.0.9_20260313",
-        sys_software: 'iOS 26.2.1',
-        network: 'wifi',
-        memory: '7672',
-        device_id: 'iPhone X<iPhone18,3>',
-    }
+        ...protocolProfile.device_info,
+        client_version: protocolProfile.clientVersion,
+    },
 };
 
 // 生长阶段枚举
