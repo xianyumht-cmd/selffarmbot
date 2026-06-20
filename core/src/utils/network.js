@@ -7,6 +7,13 @@ const EventEmitter = require('node:events');
 const process = require('node:process');
 const WebSocket = require('ws');
 const { CONFIG } = require('../config/config');
+const {
+    normalizeProtocolProfile,
+    buildWebSocketUrl,
+    getWebSocketHeaders,
+    getReconnectDelayMs,
+    isTerminalWsCode,
+} = require('../config/protocol');
 const { createScheduler } = require('../services/scheduler');
 const { updateStatusFromLogin, updateStatusGold, updateStatusLevel } = require('../services/status');
 const { recordOperation } = require('../services/stats');
@@ -24,6 +31,8 @@ let serverSeq = 0;
 const pendingCallbacks = new Map();
 let wsErrorState = { code: 0, at: 0, message: '' };
 const networkScheduler = createScheduler('network');
+let reconnectAttempt = 0;
+let reconnectStopped = false;
 
 function rejectAllPendingRequests(reason = '请求被中断') {
     const entries = Array.from(pendingCallbacks.entries());
@@ -61,14 +70,45 @@ function hasOwn(obj, key) {
     return !!obj && Object.prototype.hasOwnProperty.call(obj, key);
 }
 
+function getRuntimeProtocolProfile() {
+    const base = (CONFIG.protocol && typeof CONFIG.protocol === 'object') ? CONFIG.protocol : {};
+    const cfgDevice = (CONFIG.device_info && typeof CONFIG.device_info === 'object') ? CONFIG.device_info : {};
+    return normalizeProtocolProfile({
+        ...base,
+        serverUrl: CONFIG.serverUrl || base.serverUrl,
+        clientVersion: CONFIG.clientVersion || base.clientVersion,
+        platform: CONFIG.platform || base.platform,
+        os: CONFIG.os || base.os,
+        device_info: {
+            ...(base.device_info || {}),
+            ...cfgDevice,
+            client_version: CONFIG.clientVersion || cfgDevice.client_version || base.clientVersion,
+        },
+    });
+}
+
+function resetProtocolSequence() {
+    clientSeq = 1;
+    serverSeq = 0;
+}
+
+function isLoginAuthError(err) {
+    const msg = err && err.message ? String(err.message) : String(err || '');
+    return /code=|验证失败|unauthori[sz]ed|forbidden|invalid/i.test(msg);
+}
+
 // ============ 消息编解码 ============
 async function encodeMsg(serviceName, methodName, bodyBytes, clientSeqValue) {
     let finalBody = bodyBytes || Buffer.alloc(0);
+    const profile = getRuntimeProtocolProfile();
     try {
         finalBody = await cryptoWasm.encryptBuffer(finalBody);
     } catch (e) {
-        // 兼容模式：如果加密失败（例如环境不支持），尝试发送未加密包，但打印警告
-        logWarn('系统', `WASM加密失败: ${e.message}`);
+        const message = `WASM加密失败: ${e.message}`;
+        if (profile.crypto.requireEncryptedPayload !== false) {
+            throw new Error(`${message}，已按安全策略停止发送未加密协议包`);
+        }
+        logWarn('系统', `${message}，当前已显式允许兼容明文包`);
     }
 
     const msg = types.GateMessage.create({
@@ -361,73 +401,86 @@ function handleNotify(msg) {
 }
 
 function buildDeviceInfo() {
-    const cfg = (CONFIG.device_info && typeof CONFIG.device_info === 'object') ? CONFIG.device_info : {};
+    const profile = getRuntimeProtocolProfile();
+    const cfg = (profile.device_info && typeof profile.device_info === 'object') ? profile.device_info : {};
     return {
-        client_version: String(CONFIG.clientVersion || cfg.client_version || ''),
-        sys_software: String(cfg.sys_software || 'iOS 26.2.1'),
+        client_version: String(profile.clientVersion || cfg.client_version || ''),
+        sys_software: String(cfg.sys_software || 'iOS 18.7'),
         network: String(cfg.network || 'wifi'),
         memory: String(cfg.memory || '7672'),
         device_id: String(cfg.device_id || 'iPhone X<iPhone18,3>'),
     };
 }
 
+function buildLoginRequest() {
+    const profile = getRuntimeProtocolProfile();
+    const login = profile.login || {};
+    return types.LoginRequest.create({
+        sharer_id: toLong(login.sharerId || 0),
+        sharer_open_id: String(login.sharerOpenId || ''),
+        device_info: buildDeviceInfo(),
+        share_cfg_id: toLong(login.shareCfgId || 0),
+        scene_id: String(login.sceneId || '1256'),
+        report_data: { ...(login.reportData || {}) },
+    });
+}
+
 // ============ 登录 ============
 function sendLogin(onLoginSuccess) {
-    const body = types.LoginRequest.encode(types.LoginRequest.create({
-        sharer_id: toLong(0),
-        sharer_open_id: '',
-        device_info: buildDeviceInfo(),
-        share_cfg_id: toLong(0),
-        scene_id: '1256',
-        report_data: {
-            callback: '', cd_extend_info: '', click_id: '', clue_token: '',
-            minigame_channel: 'other', minigame_platid: 2, req_id: '', trackid: '',
-        },
-    })).finish();
+    const profile = getRuntimeProtocolProfile();
+    const serviceName = profile.login.serviceName;
+    const methodName = profile.login.methodName;
+    const body = types.LoginRequest.encode(buildLoginRequest()).finish();
 
-    sendMsg('gamepb.userpb.UserService', 'Login', body, (err, bodyBytes, _meta) => {
+    sendMsg(serviceName, methodName, body, (err, bodyBytes, _meta) => {
         if (err) {
             log('登录', `失败: ${err.message}`);
-            // 如果是验证失败，直接退出进程
-            if (err.message.includes('code=')) {
-                log('系统', '账号验证失败，即将停止运行...');
+            if (isLoginAuthError(err)) {
+                log('系统', '账号验证失败或协议被拒绝，已停止该账号，避免反复重试。');
+                reconnectStopped = true;
+                networkEvents.emit('ws_error', { code: 400, message: err.message });
                 networkScheduler.setTimeoutTask('login_error_exit', 1000, () => process.exit(0));
             }
             return;
         }
         try {
             const reply = types.LoginReply.decode(bodyBytes);
-            if (reply.basic) {
-                clearWsErrorState();
-                userState.gid = toNum(reply.basic.gid);
-                userState.name = reply.basic.name || '未知';
-                userState.level = toNum(reply.basic.level);
-                userState.gold = toNum(reply.basic.gold);
-                userState.exp = toNum(reply.basic.exp);
-
-                // 更新状态栏
-                updateStatusFromLogin({
-                    name: userState.name,
-                    level: userState.level,
-                    gold: userState.gold,
-                    exp: userState.exp,
-                });
-
-                log('系统', `登录成功: ${userState.name} (Lv${userState.level})`);
-
-                console.warn('');
-                console.warn('========== 登录成功 ==========');
-                console.warn(`  GID:    ${userState.gid}`);
-                console.warn(`  昵称:   ${userState.name}`);
-                console.warn(`  等级:   ${userState.level}`);
-                console.warn(`  金币:   ${userState.gold}`);
-                if (reply.time_now_millis) {
-                    syncServerTime(toNum(reply.time_now_millis));
-                    console.warn(`  时间:   ${new Date(toNum(reply.time_now_millis)).toLocaleString()}`);
-                }
-                console.warn('===============================');
-                console.warn('');
+            if (!reply.basic) {
+                log('登录', '失败: 登录响应缺少账号基础信息');
+                networkEvents.emit('ws_error', { code: 400, message: '登录响应缺少账号基础信息' });
+                return;
             }
+
+            clearWsErrorState();
+            reconnectAttempt = 0;
+            userState.gid = toNum(reply.basic.gid);
+            userState.name = reply.basic.name || '未知';
+            userState.level = toNum(reply.basic.level);
+            userState.gold = toNum(reply.basic.gold);
+            userState.exp = toNum(reply.basic.exp);
+
+            // 更新状态栏
+            updateStatusFromLogin({
+                name: userState.name,
+                level: userState.level,
+                gold: userState.gold,
+                exp: userState.exp,
+            });
+
+            log('系统', `登录成功: ${userState.name} (Lv${userState.level})`);
+
+            console.warn('');
+            console.warn('========== 登录成功 ==========');
+            console.warn(`  GID:    ${userState.gid}`);
+            console.warn(`  昵称:   ${userState.name}`);
+            console.warn(`  等级:   ${userState.level}`);
+            console.warn(`  金币:   ${userState.gold}`);
+            if (reply.time_now_millis) {
+                syncServerTime(toNum(reply.time_now_millis));
+                console.warn(`  时间:   ${new Date(toNum(reply.time_now_millis)).toLocaleString()}`);
+            }
+            console.warn('===============================');
+            console.warn('');
 
             startHeartbeat();
             if (onLoginSuccess) onLoginSuccess();
@@ -447,25 +500,26 @@ function startHeartbeat() {
     heartbeatMissCount = 0;
 
     networkScheduler.setIntervalTask('heartbeat_interval', CONFIG.heartbeatInterval, () => {
+        const profile = getRuntimeProtocolProfile();
         if (!userState.gid) return;
 
-        // 检查上次心跳响应时间，超过 60 秒没响应说明连接有问题
+        // 检查上次心跳响应时间，超过阈值说明连接有问题
         const timeSinceLastResponse = Date.now() - lastHeartbeatResponse;
-        if (timeSinceLastResponse > 60000) {
+        if (timeSinceLastResponse > profile.reconnect.heartbeatTimeoutMs) {
             heartbeatMissCount++;
             logWarn('心跳', `连接可能已断开 (${Math.round(timeSinceLastResponse / 1000)}s 无响应, pending=${pendingCallbacks.size})`);
-            if (heartbeatMissCount >= 2) {
-                log('心跳', '尝试重连...');
-                // 清理待处理的回调，避免堆积
-                rejectAllPendingRequests('连接超时，已清理');
+            if (heartbeatMissCount >= profile.reconnect.maxHeartbeatMisses) {
+                log('心跳', '心跳连续丢失，准备重连...');
+                scheduleReconnect('心跳超时');
+                return;
             }
         }
 
         const body = types.HeartbeatRequest.encode(types.HeartbeatRequest.create({
             gid: toLong(userState.gid),
-            client_version: CONFIG.clientVersion,
+            client_version: profile.clientVersion,
         })).finish();
-        sendMsg('gamepb.userpb.UserService', 'Heartbeat', body, (err, replyBody) => {
+        sendMsg(profile.login.serviceName, profile.login.heartbeatMethodName, body, (err, replyBody) => {
             if (err || !replyBody) return;
             lastHeartbeatResponse = Date.now();
             heartbeatMissCount = 0;
@@ -481,21 +535,45 @@ function startHeartbeat() {
 let savedLoginCallback = null;
 let savedCode = null;
 
+function scheduleReconnect(reason = '连接关闭') {
+    if (reconnectStopped || !savedLoginCallback || !savedCode) return;
+    networkScheduler.clear('auto_reconnect');
+    const profile = getRuntimeProtocolProfile();
+    const delayMs = getReconnectDelayMs(reconnectAttempt, profile);
+    reconnectAttempt += 1;
+    log('系统', `[WS] ${reason}，将在${Math.round(delayMs / 1000)}秒后尝试重连...`);
+    networkScheduler.setTimeoutTask('auto_reconnect', delayMs, () => {
+        if (reconnectStopped) return;
+        reconnect(null);
+    });
+}
+
 function connect(code, onLoginSuccess) {
     savedLoginCallback = onLoginSuccess;
     if (code) savedCode = code;
-    const url = `${CONFIG.serverUrl}?platform=${encodeURIComponent(CONFIG.platform)}&os=${encodeURIComponent(CONFIG.os)}&ver=${encodeURIComponent(CONFIG.clientVersion)}&code=${encodeURIComponent(savedCode)}&openID=`;
+    reconnectStopped = false;
+
+    if (!savedCode) {
+        const err = new Error('缺少登录 Code，无法连接');
+        setWsErrorState(400, err.message);
+        networkEvents.emit('ws_error', { code: 400, message: err.message });
+        log('登录', err.message);
+        return;
+    }
+
+    const profile = getRuntimeProtocolProfile();
+    const url = buildWebSocketUrl(profile, savedCode);
+    resetProtocolSequence();
 
     ws = new WebSocket(url, {
-        headers: {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/132.0.0.0 Safari/537.36 MicroMessenger/7.0.20.1781(0x6700143B) NetType/WIFI MiniProgramEnv/Windows WindowsWechat/WMPF WindowsWechat(0x63090a13)',
-            'Origin': 'https://gate-obt.nqf.qq.com',
-        },
+        headers: getWebSocketHeaders(profile),
+        handshakeTimeout: profile.reconnect.handshakeTimeoutMs,
     });
 
     ws.binaryType = 'arraybuffer';
 
     ws.on('open', () => {
+        reconnectAttempt = 0;
         sendLogin(onLoginSuccess);
     });
 
@@ -503,16 +581,17 @@ function connect(code, onLoginSuccess) {
         handleMessage(Buffer.isBuffer(data) ? data : Buffer.from(data));
     });
 
-    ws.on('close', (code, _reason) => {
-        console.warn(`[WS] 连接关闭 (code=${code})`);
+    ws.on('close', (code, reasonBuffer) => {
+        const reason = Buffer.isBuffer(reasonBuffer) ? reasonBuffer.toString('utf8') : String(reasonBuffer || '');
+        console.warn(`[WS] 连接关闭 (code=${code}${reason ? `, reason=${reason}` : ''})`);
         cleanup(`连接关闭(code=${code})`);
-        // 自动重连：延迟 5s 后重试，复用已保存的登录回调
-        if (savedLoginCallback) {
-            networkScheduler.setTimeoutTask('auto_reconnect', 5000, () => {
-                log('系统', '[WS] 尝试自动重连...');
-                reconnect(null);
-            });
+        if (isTerminalWsCode(code, profile)) {
+            setWsErrorState(code, reason || `WebSocket close ${code}`);
+            networkEvents.emit('ws_error', { code, message: reason || `WebSocket close ${code}` });
+            log('系统', `[WS] 服务端拒绝连接(code=${code})，请更新 Code 或运行时协议配置。`);
+            return;
         }
+        scheduleReconnect(`连接关闭(code=${code})`);
     });
 
     ws.on('error', (err) => {
@@ -524,6 +603,9 @@ function connect(code, onLoginSuccess) {
             if (code) {
                 setWsErrorState(code, message);
                 networkEvents.emit('ws_error', { code, message });
+                if (isTerminalWsCode(code, getRuntimeProtocolProfile())) {
+                    reconnectStopped = true;
+                }
             }
         }
     });
@@ -538,7 +620,11 @@ function reconnect(newCode) {
     cleanup('主动重连');
     if (ws) {
         ws.removeAllListeners();
-        ws.close();
+        try {
+            ws.close();
+        } catch {
+            // ignore close failure
+        }
         ws = null;
     }
     userState.gid = 0;
